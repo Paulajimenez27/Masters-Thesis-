@@ -1,0 +1,122 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+from google.colab import drive
+
+# --- ENVIRONMENT CONFIGURATION ---
+# Mount Google Drive to read dataset files and store the output statistical report.
+drive.mount('/content/drive')
+
+# --- CONFIGURATION PATHS ---
+input_path_metrics = '...' #file with number of unique words per year
+input_path_freqs = '...' #file with frequency data
+output_path_csv = '...'
+
+# DATA LOADING & PRE-PROCESSING
+# Load the uniquewords dataset
+df_metrics = pd.read_csv(input_path_metrics, sep=';')
+
+# Load the frequencies dataset, ensuring commas are parsed as decimals
+df_freqs = pd.read_csv(input_path_freqs, decimal=',')
+
+# Clean headers to eliminate any accidental trailing or hidden spaces
+df_metrics.columns = df_metrics.columns.str.strip()
+df_freqs.columns = df_freqs.columns.str.strip()
+
+# Standardize date types to type integer across both dataframes
+df_metrics['Año'] = df_metrics['Año'].astype(int)
+df_freqs['Año'] = df_freqs['Año'].astype(int)
+
+# We obtain unique 'palabras_unicas' configurations per Term and Year.
+df_metrics_unique = df_metrics[['Termino', 'Año', 'palabras_unicas']].drop_duplicates()
+
+# Safely inner join both files based on shared categorical keys and clean NaN rows
+df_combined = pd.merge(
+    df_metrics_unique,
+    df_freqs[['Neologismo', 'Año', 'FRel']],
+    left_on=['Termino', 'Año'],
+    right_on=['Neologismo', 'Año'],
+    how='inner'
+).dropna()
+
+# Cast target columns to numeric type to prevent format errors during calculations
+df_combined['palabras_unicas'] = pd.to_numeric(df_combined['palabras_unicas'])
+df_combined['FRel'] = pd.to_numeric(df_combined['FRel'])
+
+# STATISTICAL EVALUATION METRIC 
+
+def evaluate_correlation(rho, p_value):
+    """
+    Returns an analytical text interpretation based on standard significance thresholds.
+    """
+    if p_value > 0.05:
+        return "Not significant"
+
+    if rho > 0:
+        return "Significant Positive"
+    elif rho < 0:
+        return "Significant Negative"
+    else:
+        return "No relationship"
+
+
+# SPEARMAN CORRELATION COMPUTATION
+analysis_results = []
+
+# --- GLOBAL CORRELATION METRIC (All terms together) ---
+X_global = df_combined['palabras_unicas'] #unique words
+Y_global = df_combined['FRel'] #relative frequency
+
+if len(df_combined) > 2:
+    rho_g, p_g = stats.spearmanr(X_global, Y_global)
+    
+    # Format p-value to scientific notation if it is extremely low
+    p_str_g = f"{p_g:.3e}" if p_g < 0.001 else f"{p_g:.3f}" if not np.isnan(p_g) else "N/A"
+    
+    analysis_results.append({
+        'Ambito_Analisis': 'Global Analysis (All terms combined)',
+        'Coeficiente_Spearman_rho': round(rho_g, 4) if not np.isnan(rho_g) else 0.0,
+        'Valor_p': p_str_g,
+        'Evaluacion': evaluate_correlation(rho_g, p_g) if not np.isnan(rho_g) else "Calculation Error"
+    })
+
+# --- LOCAL CORRELATION METRIC (Grouped individually per term) ---
+for term in df_combined['Termino'].unique():
+    df_sub = df_combined[df_combined['Termino'] == term]
+
+    # Spearman rank matrices require a minimum baseline sample size of 3 observations/years
+    if len(df_sub) >= 3:
+        rho_t, p_t = stats.spearmanr(df_sub['palabras_unicas'], df_sub['FRel'])
+
+        # Handle zero-variance edge cases where constant data values result in a NaN correlation matrix
+        if np.isnan(rho_t):
+            eval_text = "Not calculable (Zero variance / constant values detected for this term)"
+            rho_t = 0.0
+            p_str_t = "N/A"
+        else:
+            eval_text = evaluate_correlation(rho_t, p_t)
+            p_str_t = f"{p_t:.3e}" if p_t < 0.001 else f"{p_t:.3f}"
+
+        analysis_results.append({
+            'Ambito_Analisis': f"{term}",
+            'Coeficiente_Spearman_rho': round(rho_t, 4),
+            'Valor_p': p_str_t,
+            'Evaluacion': eval_text
+        })
+    else:
+        analysis_results.append({
+            'Ambito_Analisis': f"{term}",
+            'Coeficiente_Spearman_rho': 0.0,
+            'Valor_p': "N/A",
+            'Evaluacion': f"Insufficient data ({len(df_sub)} years registered, minimum 3 required)"
+        })
+
+# Compile calculations into a summary DataFrame
+df_report = pd.DataFrame(analysis_results)
+
+# REPORT EXPORTATION
+# Save report to csv using utf-8-sig to preserve accents and special characters
+df_report.to_csv(output_path_csv, index=False, encoding='utf-8-sig')
+
+print(f"The statistical report has been exported to your Drive under:")
+print(f"{output_path_csv}")
