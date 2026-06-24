@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
+#THIS CODE CAN BE USED WITH THE FOLLOWING MODELS:
+# 1. "dccuchile/bert-base-spanish-wwm-cased" (BETO)
+# 2. "xlm-roberta-base" (RoBERTa)
+# 3. "answerdotai/ModernBERT-base" (ModernBERT)
+
+
+# --IMPORTS--
+import torch
+import torch.nn.functional as F
+import pandas as pd
+import nltk
+from nltk.corpus import stopwords
+import string
+import os
+import re
+import csv
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForMaskedLM
+
+# --IF USING WITH GOOGLE DRIVE, ADD INPUT AND OUTPUT PATH--
+input_path = ''   # ADD DIRECTORY
+output_path = ''  # ADD DIRECTORY
+
+
+BATCH_SIZE = 16       # Batch to process by chunks
+text_col = 'name_column'  # Add name of column in document with the sentences to process
+MODEL_NAME = "dccuchile/bert-base-spanish-wwm-cased"  # CHANGE MODEL NAME HERE
+
+# --DOWNLOAD STOPWORDS DICTIONARY + REGEX for character filtering--
+
+nltk.download('stopwords')
+spanish_stop_words = set(stopwords.words('spanish'))
+valid_pattern = re.compile(r'^[a-záéíóúüñ]+$')
+
+#--DEF to detect the type of model--
+def detect_tokenizer_type(tokenizer):
+    vocab = tokenizer.get_vocab()
+    has_triangle = any(t.startswith('▁') for t in vocab)
+    has_g = any(t.startswith('Ġ') for t in vocab)
+    has_double_hash = any(t.startswith('##') for t in vocab)
+
+    if has_triangle:
+        return 'sentencepiece'
+    elif has_g:
+        return 'bpe_gpt'
+    elif has_double_hash:
+        return 'wordpiece'
+    else:
+        return 'unknown'
+
+#--DEF to identify full words (start with _,Ġ or ##) and avoid fragments--
+def is_fragment_token(token_str, tokenizer_type):
+    if tokenizer_type == 'sentencepiece':
+        return not token_str.startswith('▁')
+    elif tokenizer_type == 'bpe_gpt':
+        return not token_str.startswith('Ġ')
+    elif tokenizer_type == 'wordpiece':
+        return token_str.startswith('##')
+    return True
+
+#--lowercase + clean words--
+def clean_token(token_str, tokenizer_type):
+    if tokenizer_type == 'sentencepiece':
+        return token_str.lstrip('▁').lower()
+    elif tokenizer_type == 'bpe_gpt':
+        return token_str.lstrip('Ġ').lower()
+    elif tokenizer_type == 'wordpiece':
+        return token_str.lstrip('#').lower()
+    return token_str.lower()
+
+#--filter out non desired tokens (stopwords, >2tokens, special characters, fragments)--
+def get_tokens_to_ignore(tokenizer, spanish_stop_words, tokenizer_type):
+    vocab = tokenizer.get_vocab()
+    tokens_to_ignore = []
+
+    for token_str, token_id in vocab.items():
+        if token_str in tokenizer.all_special_tokens:
+            tokens_to_ignore.append(token_id)
+            continue
+
+        if is_fragment_token(token_str, tokenizer_type):
+            tokens_to_ignore.append(token_id)
+            continue
+
+        clean_t = clean_token(token_str, tokenizer_type)
+
+        if (not bool(valid_pattern.match(clean_t)) or
+                clean_t in spanish_stop_words or
+                len(clean_t) < 2):
+            tokens_to_ignore.append(token_id)
+
+    return tokens_to_ignore
+
+#--DEF process (by batches, takes text, model and filtering conditions)--
+def process_batch(batch_texts, tokenizer, model, device, tokens_to_ignore):
+    mask_token = tokenizer.mask_token
+    prepared_texts = [
+        t.replace('[MASK]', mask_token).replace('<mask>', mask_token) #adjusts masking label to model
+        for t in batch_texts
+    ]
+
+    inputs = tokenizer(
+        prepared_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+    batch_results = [] #PROCESS BY BATCH
+    for i in range(len(batch_texts)):
+        mask_token_id = tokenizer.mask_token_id
+        mask_idx = torch.where(inputs["input_ids"][i] == mask_token_id)[0]
+
+        if len(mask_idx) > 0: #in case there is no "MASK"
+            m_logits = logits[i, mask_idx[0], :].clone()
+            m_logits[tokens_to_ignore] = float('-inf') #inf = ignore (0 probability)
+
+            probs = F.softmax(m_logits, dim=-1) #APPLY SOFTMAX TO GET PROBABILITIES
+            top_3_p, top_3_i = torch.topk(probs, 3)
+
+            formatted_preds = []
+            for idx, p in zip(top_3_i, top_3_p):#FORMATS RESULT (word, probability)
+                if p.item() > 0:
+                    word = tokenizer.decode([idx]).strip()
+                    formatted_preds.append(f"{word} ({p.item():.4f})")
+
+            batch_results.append(
+                ", ".join(formatted_preds) if formatted_preds else "NO_VALID_PREDICTION"
+            )
+        else:
+            batch_results.append("MASK_NOT_FOUND")
+
+    return batch_results
+
+
+# --MAIN EXECUTION--
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+if os.path.exists(input_path):
+    try:
+        df = pd.read_csv(
+            input_path, sep=None, engine='python',
+            encoding='utf-8-sig', quotechar='"', on_bad_lines='skip'
+        )
+        print(f"Columns found: {df.columns.tolist()}")
+
+        if text_col in df.columns:
+            df[text_col] = df[text_col].astype(str)
+            mask_filter = df[text_col].str.contains(r"\[MASK\]", na=False) #only lines with "MASK"
+            indices_to_process = df[mask_filter].index.tolist()
+            
+            #CALL TOKENIZER AND MODEL
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME) 
+            model = AutoModelForMaskedLM.from_pretrained(
+                MODEL_NAME,
+                torch_dtype=torch.float32
+            ).to(device)
+            model.eval()
+
+            tok_type = detect_tokenizer_type(tokenizer) #depending on model
+            print(f"Detected tokenizer type: {tok_type}")
+
+            tokens_to_ignore = get_tokens_to_ignore(tokenizer, spanish_stop_words, tok_type)
+           
+            #-- save predictions into csv --
+            predictions = [""] * len(df)
+            for i in tqdm(range(0, len(indices_to_process), BATCH_SIZE), desc=MODEL_NAME):
+                batch_indices = indices_to_process[i: i + BATCH_SIZE]
+                batch_texts = df.loc[batch_indices, text_col].tolist()
+                results = process_batch(batch_texts, tokenizer, model, device, tokens_to_ignore)
+                for idx, res in zip(batch_indices, results):
+                    predictions[idx] = res
+
+            df["Predictions"] = predictions #names new column in document
+            df.to_csv(output_path, index=False, sep=',',
+                      encoding='utf-8-sig', quoting=csv.QUOTE_NONNUMERIC)
+        #errors printing    
+        else:
+            print(f"ERROR: Column '{text_col}' not found") 
+
+    except Exception as e:
+        print(f"Error processing file: {e}")
+else:
+    print(f"File not found at: {input_path}")
