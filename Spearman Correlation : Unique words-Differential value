@@ -1,0 +1,93 @@
+import numpy as np
+import pandas as pd
+from google.colab import drive
+from scipy.stats import spearmanr
+
+# ENVIRONMENT SETUP & STORAGE PATHS
+# Mount Google Drive to read dataset files and store the output statistical report.
+drive.mount('/content/drive')
+
+# Update paths 
+# Both files should include same neologisms and years to be able to connect them
+input_path_lexicon = '...'  # File that contains differential value 
+input_path_heaps = '...' # File that contains number of unique words
+output_path_csv   = '...'
+
+
+# DATA LOADING & PRE-PROCESSING
+
+print("Loading source files...")
+df1 = pd.read_csv(input_path_lexicon)
+df2 = pd.read_csv(input_path_heaps)
+
+# Clean column headers and text values to eliminate any accidental white spaces
+df1.columns = df1.columns.str.strip()
+df2.columns = df2.columns.str.strip()
+df1['Neologismo'] = df1['Neologismo'].astype(str).str.strip()
+df2['Termino'] = df2['Termino'].astype(str).str.strip()
+
+
+# DATA ALIGNMENT (INNER JOIN)
+
+# Align records by tracking terms and chronological years.
+# update name of columns for the one containing the list of neologisms and year
+# Example: df1 maps using 'Neologismo' and df2 maps using 'Termino'. Both share the 'Año' field.
+print("Aligning datasets by term and year...")
+df_combined = pd.merge(
+    df1,
+    df2,
+    left_on=['Neologismo', 'Año'],
+    right_on=['Termino', 'Año'],
+    how='inner'
+)
+
+# SPEARMAN ANALYSIS PIPELINE PER GROUP
+
+def compute_spearman(group):
+    """
+    Computes the Spearman rank correlation for a given grouped term over time.
+    """
+    # Drop rows containing missing values in the target variables
+    clean_data = group.dropna(subset=['palabras_unicas', 'Dif_Frec'])
+
+    # Spearman rank correlation matrices require a minimum baseline sample size of 3 data points (years)
+    if len(clean_data) < 3:
+        return pd.Series({
+            'spearman_coefficient': np.nan,
+            'p_value': np.nan,
+            'analyzed_years_count': len(clean_data),
+            'execution_note': 'Insufficient data (<3 years found)'
+        })
+
+    # Validate zero-variance states where constant values would invalidate correlation calculations
+    if clean_data['palabras_unicas'].std() == 0 or clean_data['Dif_Frec'].std() == 0:
+        return pd.Series({
+            'spearman_coefficient': np.nan,
+            'p_value': np.nan,
+            'analyzed_years_count': len(clean_data),
+            'execution_note': 'Zero variance detected in data arrays'
+        })
+
+    # Execute Spearman statistical evaluation
+    coef, p_val = spearmanr(clean_data['palabras_unicas'], clean_data['Dif_Frec'])
+
+    return pd.Series({
+        'spearman_coefficient': coef,
+        'p_value': p_val,
+        'analyzed_years_count': len(clean_data),
+        'execution_note': 'OK'
+    })
+
+
+# EXECUTION & GROUPING ANALYSIS
+
+print("Computing Spearman correlation metrics individually per term...")
+results = (
+    df_combined.groupby('Termino')
+    .apply(compute_spearman, include_groups=False)
+    .reset_index()
+)
+
+#   SAVE
+results.to_csv(output_path_csv, index=False, encoding='utf-8-sig')
+
