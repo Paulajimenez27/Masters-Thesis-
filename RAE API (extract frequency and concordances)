@@ -1,0 +1,180 @@
+import pandas as pd
+import time
+import requests
+import random
+import re
+import os
+
+# --- ENVIRONMENT & ENVIRONMENT CONFIGURATION ---
+# This script requires a local Jupyter Notebook environment to use the machine's local IP address.
+# Google Colab is not recommended due to IP blocking/sharing policies on the RAE API.
+# Note: To access Google Drive via local Jupyter, install Google Drive for Desktop and set up paths as shown below.
+
+base_path = r'E:\Mi unidad\MOVIDA_JUPYTER' # Base directory (without file name)
+input_path = os.path.join(base_path, 'neologismos reagrupados.csv') # Input dataset
+output_path_conc = os.path.join(base_path, 'resultados_rae_final(conc)_CORPES.csv') # Output dataset (Concordances)
+output_path_stats = os.path.join(base_path, 'resultados_rae_final(stats)_CORPES.csv') # Output dataset (Statistics)
+
+# Checkpoint files to resume progress in case of runtime errors
+progress_path_conc = os.path.join(base_path, 'progreso_concordanciasCORPES.csv')
+progress_path_stats = os.path.join(base_path, 'progreso_statsCORPES.csv')
+
+# --- API CONFIGURATION ---
+HEADERS = {'Authorization': '-', 'Content-Type': 'application/json'} # Update authorization token here
+
+# Corpus Selection URL (Toggle between CORPES and CREA)
+URL = "https://apps2.rae.es/api-corpes-1.3/search" # For CORPES
+# URL = 'https://apps2.rae.es/api-crea/search'     # For CREA
+
+def ejecutar_api_rae_completa(word, neo_id):
+    """
+    Queries the RAE API to fetch concordances and frequency statistics for a given neologism.
+    
+    Parameters:
+    word (str): The neologism to search for.
+    neo_id (str): Formatted ID for tracking.
+    
+    Returns:
+    tuple: Lists of dictionaries containing concordance data and statistical data.
+    """
+    conc_local = []
+    stats_local = []
+    
+    # Define API queries for concordances and frequency distribution
+    q_conc = {"inputQuery": f"Get from concors where l='{word}' window v='1,100'"} # Requests up to 100 concordances
+    q_stats = {"inputQuery": f"Get país, anno, tema from stats where l='{word}'"} # Requests country, year, topic, and frequencies
+    
+    try:
+        # --- 1. FETCH CONCORDANCES ---
+        # Output format includes: concordance ID, highlighted text, topic, country, year, neologism.
+        res_c = requests.post(URL, headers=HEADERS, json=q_conc, timeout=30)
+        if res_c.status_code == 200:
+            values = res_c.json().get('values', [])
+            for i, v in enumerate(values):
+                biblio = v.get('bibliography', {})
+                conc_local.append({
+                    "ID_Conc": f"{neo_id}_{str(i+1).zfill(5)}",
+                    "Concordancia": f"{v.get('txt_p_ant', '').strip()} **{v.get('w_plain', '').strip().upper()}** {v.get('txt_p_pos', '').strip()}",
+                    "Tema": biblio.get('tema', 'Sin tema'),
+                    "País": v.get('country', 'S/P'),
+                    "Año": v.get('year', 'S/F'),
+                    "ID_Neo": neo_id,
+                    "Neologismo": word
+                })
+
+        # --- 2. FETCH STATISTICS ---
+        # Parses overall absolute/relative frequencies and yearly breakdown using regex.
+        res_s = requests.post(URL, headers=HEADERS, json=q_stats, timeout=30)
+        if res_s.status_code == 200:
+            stats_data = res_s.json()
+            msg_text = stats_data.get('msg', '')
+            
+            # Extract frequencies using Regular Expressions from the HTML-formatted response string
+            f_abs_m = re.search(r'Frecuencia absoluta:</b>\s*([\d,.]+)', msg_text)
+            f_rel_m = re.search(r'Frecuencia normalizada:</b>\s*([\d,.]+)', msg_text)
+
+            years_rows = []
+            for block in stats_data.get('data', []):
+                headers = block.get('table', {}).get('header', [])
+                if any(h.get('label') == 'Año' for h in headers):
+                    years_rows = block.get('table', {}).get('values', [])
+                    break
+
+            col_abs = [f"{f.get('val')}:{f.get('freq', 0)}" for f in years_rows if f.get('val')]
+            col_rel = [f"{f.get('val')}:{f.get('rfreq', 0)}" for f in years_rows if f.get('val')]
+
+            stats_local.append({
+                "ID_Neo": neo_id,
+                "Neologismo": word,
+                "F_absoluta": f_abs_m.group(1) if f_abs_m else "0",
+                "F_rel": f_rel_m.group(1) if f_rel_m else "0",
+                "Año_abs": " | ".join(col_abs),
+                "Año_rel": " | ".join(col_rel)
+            })
+            
+    except Exception as e:
+        print(f"Error processing word '{word}': {e}")
+        
+    return conc_local, stats_local
+
+# --- DATA LOADING & CHECKPOINT RESUMPTION ---
+# Checks for existing progress files to resume processing from the last saved state.
+try:
+    df_source = pd.read_csv(input_path, encoding='utf-8')
+    already_processed = [] 
+    results_CONC = []
+    results_STATS = []
+    
+    if os.path.exists(progress_path_stats):
+        df_previous = pd.read_csv(progress_path_stats, sep=';', encoding='utf-8-sig')
+        already_processed = df_previous['Neologismo'].str.strip().str.lower().tolist()
+        results_STATS = df_previous.to_dict('records')
+        
+        # Load previous concordances if checkpoint exists
+        if os.path.exists(progress_path_conc):
+            results_CONC = pd.read_csv(progress_path_conc, sep=';', encoding='utf-8-sig').to_dict('records')
+            
+        global_neo_counter = len(set(already_processed)) + 1
+        print(f"Skipping {len(set(already_processed))} words. Resuming at ID {global_neo_counter}")
+    else:
+        global_neo_counter = 1
+except Exception as e:
+    print(f"Error loading files: {e}")
+    exit()
+
+# Grouping and filtering words by linguistic categories, excluding already processed terms
+categories = ['sufijación', 'manlleu', 'composicio', 'otros']
+lists_by_category = {}
+for cat in categories:
+    full_list = df_source[df_source['tipus_reagrupado'] == cat]['neologisme'].dropna().tolist()
+    lists_by_category[cat] = [word for word in full_list if word.strip().lower() not in already_processed]
+
+# --- MAIN LOOP (Batch processing to respect API rate limits) ---
+NUM_BATCHES = 15
+WORDS_PER_CATEGORY = 10
+
+try:
+    for b in range(NUM_BATCHES):
+        print(f"\n>>> PROCESSING BATCH {b+1} / {NUM_BATCHES}")
+        data_available = False
+
+        for cat in categories:
+            # Extract a chunk of words for the current category
+            segment = [lists_by_category[cat].pop(0) for _ in range(min(len(lists_by_category[cat]), WORDS_PER_CATEGORY))]
+            
+            if segment:
+                data_available = True
+                print(f"\n--- Category: {cat.upper()} ---")
+                for word in segment:
+                    neologism_id = str(global_neo_counter).zfill(3) 
+                    
+                    c_list, s_list = ejecutar_api_rae_completa(word, neologism_id)
+                    
+                    results_CONC.extend(c_list)
+                    results_STATS.extend(s_list)
+
+                    # Real-time checkpoint saving to avoid data loss
+                    pd.DataFrame(results_CONC).to_csv(progress_path_conc, index=False, sep=';', encoding='utf-8-sig')
+                    pd.DataFrame(results_STATS).to_csv(progress_path_stats, index=False, sep=';', encoding='utf-8-sig')
+                   
+                    print(f"  [{neologism_id}] Processed: {word}")
+                    global_neo_counter += 1
+                    
+                    # 5-minute cooldown between requests to prevent API blocking/rate-limiting
+                    time.sleep(300) 
+
+        if not data_available: 
+            print("No more pending words to process.")
+            break
+            
+        # Optional manual gate between batches. Can be removed for fully automated execution.
+        input(f"\nBatch {b+1} completed. Press ENTER to continue to the next batch...") 
+
+except KeyboardInterrupt:
+    print("\nProcess interrupted by the user. Progress saved.")
+
+# --- FINAL DATA EXPORT ---
+if results_CONC:
+    pd.DataFrame(results_CONC).to_csv(output_path_conc, index=False, sep=';', encoding='utf-8-sig')
+    pd.DataFrame(results_STATS).to_csv(output_path_stats, index=False, sep=';', encoding='utf-8-sig')
+    print("\nProcess finished successfully! Final files saved.")
