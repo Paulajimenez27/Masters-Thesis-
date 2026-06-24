@@ -1,0 +1,124 @@
+import numpy as np
+import pandas as pd
+from google.colab import drive
+from scipy.stats import spearmanr
+
+
+# ENVIRONMENT SETUP & STORAGE PATHS
+# Mount Google Drive to read dataset files and store the output statistical report.
+drive.mount('/content/drive')
+
+# File path settings (Modify these to match your Google Drive structure)
+path_logratio = '...'   # File containing logratio scores
+path_heaps    = '...' # File containing unique words
+path_output   = '...'
+
+
+# DATA LOADING & PRE-PROCESSING
+
+print("Loading dataset files...")
+df_log = pd.read_csv(path_logratio)
+df_heap = pd.read_csv(path_heaps, sep=';')  
+
+# Clean headers to eliminate any accidental trailing or hidden spaces
+df_log.columns = df_log.columns.str.strip()
+df_heap.columns = df_heap.columns.str.strip()
+
+# Standardize neologism string formats across both dataframes
+df_log['Neologismo'] = df_log['Neologismo'].astype(str).str.strip()
+df_heap['Termino'] = df_heap['Termino'].astype(str).str.strip()
+
+# Standardize tracking chronological keys to integer types
+df_log['Año'] = df_log['Año'].astype(int)
+df_heap['Año'] = df_heap['Año'].astype(int)
+
+
+# DATA ALIGNMENT (INNER JOIN)(Neologism/Term and Year)
+df_combined = pd.merge(
+    df_log,
+    df_heap,
+    left_on=['Neologismo', 'Año'],
+    right_on=['Termino', 'Año'],
+    how='inner'
+)
+
+# MATHEMATICAL CLEANING: Filter out rows containing NaN values within target continuous variables
+df_analysis = df_combined.dropna(subset=['logratio', 'palabras_unicas']).copy()
+
+print(f"Total active records remaining after merge and cleanup: {len(df_analysis)}")
+
+
+# LOCAL CORRELATION PIPELINE (INDIVIDUAL PER TERM)
+
+def calculate_spearman_ind(group):
+    """
+    Evaluates individual validation checks and computes the Spearman rank metrics 
+    for a single neologism group across active years.
+    """
+    # Spearman rank matrices require a baseline sample size of 3 data points (years)
+    if len(group) < 3:
+        return pd.Series({
+            'spearman_coefficient': np.nan, 
+            'p_value': np.nan, 
+            'execution_note': 'Insufficient data (<3 years found)'
+        })
+        
+    # Check for zero variance configurations that invalidate the covariance matrix
+    if group['palabras_unicas'].std() == 0 or group['logratio'].std() == 0:
+        return pd.Series({
+            'spearman_coefficient': np.nan, 
+            'p_value': np.nan, 
+            'execution_note': 'Zero variance detected'
+        })
+
+    # Compute correlation metrics
+    coef, p_val = spearmanr(group['palabras_unicas'], group['logratio'])
+    status = "Significant" if p_val < 0.05 else "Not significant"
+
+    return pd.Series({
+        'spearman_coefficient': coef,
+        'p_value': p_val,
+        'execution_note': status
+    })
+
+# Group data and apply the mathematical function pipeline
+results_ind = (
+    df_analysis
+    .groupby('Termino')
+    .apply(calculate_spearman_ind, include_groups=False)
+    .reset_index()
+)
+
+# Export local results to target directory
+results_ind.to_csv(path_output, index=False, encoding='utf-8-sig')
+
+# POOLED METRIC EVALUATION (GLOBAL ANALYSIS)
+print("\n" + "="*50)
+print("GLOBAL CORRELATION ANALYSIS: logratio ~ palabras_unicas")
+print("="*50)
+
+n_total = len(df_analysis)
+
+if n_total > 2:
+    # Compute pooled global statistical correlation across all rows combined
+    coef_global, p_value_global = spearmanr(df_analysis['palabras_unicas'], df_analysis['logratio'])
+
+    if p_value_global < 0.05:
+        interpretation = "SIGNIFICANT POSITIVE" if coef_global > 0 else "SIGNIFICANT NEGATIVE"
+    else:
+        interpretation = "NOT SIGNIFICANT"
+
+    # Print consolidated statistics to standard output console
+    print(f"Global N (Pooled Year-Term records):   {n_total}")
+    print(f"Global Spearman rho Coefficient:       {coef_global:.4f}")
+    print(f"Global p-value metric:                 {p_value_global:.4e}") # Fixed syntax error from .4ef to .4e
+    print(f"Global statistical evaluation:         {interpretation}")
+
+    # Display execution summary report categorization
+    note_counts = results_ind['execution_note'].value_counts()
+    print(f"\nSummary breakdown of individual terms processing:")
+    for note_type, count in note_counts.items():
+        print(f"  - {note_type}: {count} term(s)")
+
+else:
+    print("Insufficient global data density available to compute statistical metrics.")
