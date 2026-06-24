@@ -1,0 +1,143 @@
+import os
+import numpy as np
+import pandas as pd
+from google.colab import drive
+from scipy.stats import spearmanr
+
+# ENVIRONMENT SETUP & STORAGE PATHS
+# Mount Google Drive 
+drive.mount("/content/drive")
+
+# Parameter configuration
+WINDOW_SIZE = 5 #for the global correlation
+PERIODO     = 5 #for each period correlation
+
+# Update column names
+COL_ID         = "ID_Neo" #neologism id
+COL_NEO        = "Neologismo" #neologism
+COL_YEAR       = "Año" #year
+COL_DELTA_NEO  = "Δ_Neo" #frequency variation neologism
+COL_DELTA_LEMA = "Δ_Media_Lemas" #frequency variation general lexicon words
+
+# File paths configurations
+RUTA_ENTRADA  = "..." #input file
+RUTA_GLOBALES = "..." #output file global correlaiton
+RUTA_PERIODOS = "..." #output file correlation per periods
+
+#  DATA LOADING & PRE-PROCESSING
+
+if not os.path.exists(RUTA_ENTRADA):
+    raise FileNotFoundError(f"Input file not found at: {RUTA_ENTRADA}")
+
+df = pd.read_csv(RUTA_ENTRADA)
+
+# Clean dataset: Filter out groups where the sum of absolute changes is zero
+df = df.groupby(COL_ID).filter(lambda x: x[COL_DELTA_NEO].fillna(0).abs().sum() > 0).copy()
+
+AÑO_MIN = int(df[COL_YEAR].min())
+AÑO_MAX = int(df[COL_YEAR].max())
+
+# STATISTICAL ANALYSIS PIPELINES
+def compute_rolling_spearman(group, window_size=5):
+    """
+    Computes chronological rolling-window Spearman correlations 
+    between neologism changes (Δ_Neo) and general lexicon changes (Δ_Media_Lemas).
+    """
+    # Enforce chronological ordering before calculating time-series windows
+    group = group.sort_values(COL_YEAR).reset_index(drop=True)
+    
+    years = group[COL_YEAR].values
+    d_neo = group[COL_DELTA_NEO].fillna(0).values
+    d_lem = group[COL_DELTA_LEMA].fillna(0).values
+
+    window_metrics = []
+    
+    for i in range(len(group) - window_size + 1):
+        x = d_neo[i : i + window_size]
+        y = d_lem[i : i + window_size]
+        
+        # VALIDATION CHECK: Prevent covariance errors if an array has zero variance
+        if np.std(x) > 1e-10 and np.std(y) > 1e-10:
+            rho, _ = spearmanr(x, y)
+        else:
+            rho = np.nan
+
+        window_metrics.append({
+            "start_year": years[i], 
+            "spearman_rho": rho
+        })
+
+    df_windows = pd.DataFrame(window_metrics)
+
+    return {
+        "window_data": df_windows,
+        "max_rho":     round(df_windows["spearman_rho"].max(), 3),
+        "mean_rho":    round(df_windows["spearman_rho"].mean(), 3)
+    }
+
+
+def compute_period_means(df_windows, año_min, año_max, periodo):
+    """
+    Aggregates the rolling window coefficients into fixed chronological blocks.
+    """
+    starts = range(año_min, año_max, periodo)
+    period_results = {}
+    
+    for ini in starts:
+        fin = ini + periodo - 1
+        # Prevent parsing the 2025-2029 threshold if no data is logged yet
+        if ini >= 2025: 
+            continue
+
+        label = f"mean_rho_{ini}-{fin}"
+        mask = (df_windows["start_year"] >= ini) & (df_windows["start_year"] <= fin)
+        valid_values = df_windows.loc[mask, "spearman_rho"].dropna()
+        
+        period_results[label] = round(float(valid_values.mean()), 3) if len(valid_values) > 0 else np.nan
+        
+    return period_results
+
+# MAIN PROCESSING LOOP
+
+global_report_rows = []
+period_report_rows = []
+
+for id_neo, group in df.groupby(COL_ID):
+    name = group[COL_NEO].iloc[0]
+    
+    # Initialize row baselines
+    global_row = {COL_ID: id_neo, COL_NEO: name}
+    period_row = {COL_ID: id_neo, COL_NEO: name}
+
+    # Run rolling window analysis if the time series matches baseline sample requirements
+    if len(group) >= WINDOW_SIZE:
+        rolling_res = compute_rolling_spearman(group, WINDOW_SIZE)
+
+        global_row.update({
+            "max_rho":  rolling_res["max_rho"],
+            "mean_rho": rolling_res["mean_rho"]
+        })
+
+        # Calculate chronological segmented periods
+        period_metrics = compute_period_means(rolling_res["window_data"], AÑO_MIN, AÑO_MAX, PERIODO)
+        period_row.update(period_metrics)
+    else:
+        # Pad missing values if time frame series are shorter than window targets
+        global_row.update({"max_rho": np.nan, "mean_rho": np.nan})
+
+    global_report_rows.append(global_row)
+    period_report_rows.append(period_row)
+
+# DATASET RESTRUCTURING & CLEAN EXPORTATION
+df_globales = pd.DataFrame(global_report_rows)
+df_periodos = pd.DataFrame(period_report_rows)
+
+target_columns_report1 = [COL_ID, COL_NEO, "max_rho", "mean_rho"]
+df_globales = df_globales[[c for c in target_columns_report1 if c in df_globales.columns]]
+
+# Save 
+print("Exporting processed metric sheets to drive...")
+os.makedirs(os.path.dirname(RUTA_GLOBALES), exist_ok=True)
+
+df_globales.to_csv(RUTA_GLOBALES, index=False, encoding="utf-8-sig")
+df_periodos.to_csv(RUTA_PERIODOS, index=False, encoding="utf-8-sig")
