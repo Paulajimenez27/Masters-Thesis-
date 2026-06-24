@@ -1,0 +1,69 @@
+import os
+import pandas as pd
+from google.colab import drive
+
+# --- GOOGLE DRIVE MOUNTING ---
+# Mount Google Drive to access input datasets and save output files directly.
+drive.mount('/content/drive')
+
+# --- FILE PATH CONFIGURATION ---
+# Update these paths to match your specific Google Drive directory structure.
+input_path = '/.../'
+output_path = '/.../'
+
+# Load the dataset into a pandas DataFrame
+df = pd.read_csv(input_path)
+
+
+def meets_conditions(sentence):
+    """Filters sentences based on length and target token position constraints.
+
+    Parameters:
+    sentence (str): The text string to evaluate.
+
+    Returns:
+    bool: True if the sentence satisfies all linguistic constraints, False
+    otherwise.
+    """
+    # Ensure the input is a valid string
+    if not isinstance(sentence, str):
+        return False
+
+    words = sentence.split()
+    n = len(words)
+
+    # Constraint 1: Sentence must contain more than 15 words
+    if n <= 15:
+        return False
+
+    # Locate the position of the '[MASK]' token (0-based index)
+    # Note: Modify the string inside .index() if using a different mask token (e.g., for different language models)
+    try:
+        pos = words.index('[MASK]')
+    except ValueError:
+        return False  # Exclude sentence if '[MASK]' token is missing
+
+    # Constraint 2: '[MASK]' token must not be within the first 5 words (indices 0-4)
+    if pos < 5:
+        return False
+
+    # Constraint 3: '[MASK]' token must not be within the last 5 words (indices from n-5 to n-1)
+    if pos >= n - 5:
+        return False
+
+    return True
+
+
+# --- DATA FILTERING EXECUTION ---
+# Apply the filtering criteria to the target column.
+# Ensure 'concordancia' matches the exact column name in your CSV file.
+mask = df['concordancia'].apply(meets_conditions)
+df_filtered = df[mask].reset_index(drop=True)
+
+print(f"\nTotal rows after filtering: {len(df_filtered)}")
+
+# --- FINAL EXPORT ---
+# Save the clean dataset using 'utf-8-sig' to ensure proper encoding of special characters (e.g., accents).
+df_filtered.to_csv(output_path, index=False, encoding='utf-8-sig')
+
+print(f"\nFiltered dataset successfully saved to: {output_path}")
