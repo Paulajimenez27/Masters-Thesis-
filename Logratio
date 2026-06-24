@@ -1,0 +1,74 @@
+import numpy as np
+import pandas as pd
+from google.colab import drive
+
+
+# ENVIRONMENT SETUP & STORAGE PATHS
+# Mount Google Drive to read inputs and export results.
+drive.mount('/content/drive')
+
+# Update file paths (the format of both files is different -long/wide- and requires melting
+PATH_LONG = '...'      # Contains relative frequencies neologisms (FRel) 
+PATH_WIDE = '...' # Contains frequency general lexicon words (Medialexgen)
+PATH_OUTPUT = '...'
+
+# DATA LOADING
+df_long = pd.read_csv(PATH_LONG, sep=',', decimal=',')
+df_wide = pd.read_csv(PATH_WIDE, sep=',', decimal=',')
+
+# DATA CLEANING & KEY STANDARDIZATION (not needed if your files have same format)
+
+# Standardize the 'Año' (Year) column to integer type across both dataframes
+df_long['Año'] = df_long['Año'].astype(int)
+df_wide['Año'] = df_wide['Año'].astype(int)
+
+# Homogeneize neologism text strings by stripping whitespaces and converting to lowercase
+df_long['Neologismo'] = df_long['Neologismo'].str.strip().str.lower()
+df_wide['Neologismo'] = df_wide['Neologismo'].str.strip().str.lower()
+
+
+# FEATURE SELECTION
+
+# Extract only the essential tracking variables required for the statistical merge
+df_frel = df_long[['Neologismo', 'Año', 'FRel']].copy()
+df_media = df_wide[['Neologismo', 'Año', 'Medialexgen']].copy()
+
+# DATA ALIGNMENT (INNER JOIN)
+# Merge features on Neologism and Year relational keys
+df_merge = pd.merge(
+    df_media,
+    df_frel,
+    on=['Neologismo', 'Año'],
+    how='inner'
+)
+
+# LOG-RATIO METRIC COMPUTATION
+
+# MATHEMATICAL SAFEGUARD:
+# Replace values <= 0 with NaN to prevent math errors (undefined results) when calculating logarithms.
+df_merge['Medialexgen_safe'] = df_merge['Medialexgen'].apply(lambda x: x if x > 0 else np.nan)
+df_merge['FRel_safe'] = df_merge['FRel'].apply(lambda x: x if x > 0 else np.nan)
+
+# Compute the log-ratio index: log2(Medialexgen / FRel)
+df_merge['logratio'] = np.log2(df_merge['Medialexgen_safe'] / df_merge['FRel_safe'])
+
+# Track rows where the metric could not be calculated due to zero or empty values
+null_count = df_merge['logratio'].isna().sum()
+print(f"NaN metrics detected in logratio (due to zero values or null entries): {null_count}")
+
+
+# EXPORT SUMMARY REPORT
+df_result = df_merge[['Neologismo', 'Año', 'Medialexgen', 'FRel', 'logratio']].copy()
+
+# Sort results chronologically per unique neologism and clear index
+df_result = df_result.sort_values(['Neologismo', 'Año']).reset_index(drop=True)
+
+# Round numeric metrics for cleaner data presentation
+df_result['Medialexgen'] = df_result['Medialexgen'].round(4)
+df_result['FRel'] = df_result['FRel'].round(4)
+df_result['logratio'] = df_result['logratio'].round(4)
+
+
+# Export results 
+df_result.to_csv(PATH_OUTPUT, index=False, encoding='utf-8-sig')
+print(f"\nFile successfully exported to: {PATH_OUTPUT}")
