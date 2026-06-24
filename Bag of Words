@@ -1,0 +1,166 @@
+# ENVIRONMENT SETUP & ENVIRONMENT PATHS
+
+import re
+from collections import Counter, defaultdict
+import nltk
+import pandas as pd
+import spacy
+from google.colab import drive
+from nltk.corpus import stopwords
+
+
+nltk.download('stopwords', quiet=True)
+nlp = spacy.load('es_core_news_sm')
+
+# Define base Spanish stopwords and expand with relevant high-frequency corpus particles
+stop_words = set(stopwords.words('spanish'))
+stop_words.update(['si', 'así', 'también', 'pero', 'aunque', 'porque', 'cuando', 'donde'])
+
+
+# Mount Google Drive 
+drive.mount('/content/drive')
+
+# Update file paths
+FILE_PATH = '...' #file with concordances
+OUTPUT_TRIGRAMS = '...' #result file with all the extracted trigrams
+OUTPUT_BOW       = '...' #result file with bag of words
+
+# Read data 
+df = pd.read_csv(FILE_PATH, sep=';', encoding='utf-8-sig')
+
+
+#  PRE-PROCESSING 
+
+def clean_text(text):
+    """
+    Applies regex sanitization: lowers casing, strips custom non-alphanumeric 
+    punctuation bounds, removes loose hyphens, and truncates structural spaces.
+    """
+    if pd.isna(text):
+        return ''
+    text = str(text).lower()
+    # Strip custom special characters, bounding punctuation, quotes and symbols
+    text = re.sub(r'[^\w\sáéíóúüñ-]', ' ', text)
+    # Clear redundant single hyphens and multi-space intervals
+    text = re.sub(r'\s*-\s*', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def lemmatize_and_filter(text):
+    """
+    Tokenizes text arrays using SpaCy models, enforces absolute stopword lists, 
+    clears isolated punctuation bounds, and extracts alphabetic lemmas > 2 characters.
+    """
+    doc = nlp(text[:10000])  # Performance safety bounding limit
+    tokens = []
+    for token in doc:
+        if (not token.is_stop
+                and not token.is_punct
+                and not token.is_space
+                and len(token.lemma_) > 2
+                and token.lemma_.lower() not in stop_words
+                and token.lemma_.isalpha()):
+            tokens.append(token.lemma_.lower())
+    return tokens
+
+
+def extract_term_context_trigrams(tokens, base_term):
+    """
+    Scans contextual token frames via an N-gram sliding window to isolate 
+    trigram tuples containing the localized target neologism lemma.
+    """
+    trigrams = []
+    for i in range(len(tokens) - 2):
+        trigram = (tokens[i], tokens[i+1], tokens[i+2])
+        if base_term in trigram:
+            trigrams.append(trigram)
+    return trigrams
+
+# Enforce whitespace normalization across input header frames
+df.columns = df.columns.str.strip()
+
+# Update names for columns with concordance, year and neologism
+COL_CONCORDANCE = 'concordancia'
+COL_YEAR = 'fecha'
+COL_NEOLOGISM = 'término'
+
+# Ensure existence validation checks for structural keys prior to pipeline runtime
+for col in [COL_CONCORDANCE, COL_YEAR, COL_NEOLOGISM]:
+    if col not in df.columns:
+        print(f"Target variable header '{col}' missing from schema")
+
+# Lower and clean contextual query keywords
+df[COL_NEOLOGISM] = df[COL_NEOLOGISM].str.lower().str.strip()
+df_filtered = df.copy()
+
+# Multi-dimensional analytics structure tracking: {neologism: {year: [trigram_tuples]}}
+analysis_registry = defaultdict(lambda: defaultdict(list))
+
+# Iterate through dataset blocks
+total_records = len(df_filtered)
+for idx, (i, row) in enumerate(df_filtered.iterrows()):
+    if idx % 200 == 0:
+        print(f"Processing index milestone: {idx}/{total_records}...")
+
+    term = str(row[COL_NEOLOGISM]).strip().lower()
+    year = str(row[COL_YEAR]).strip()
+    concordance = str(row[COL_CONCORDANCE])
+
+    # Execute text token extraction metrics
+    clean_passage = clean_text(concordance)
+    tokens = lemmatize_and_filter(clean_passage)
+
+    # Resolve compound keywords to extract core headward lemma string
+    term_lemma = nlp(term)[0].lemma_.lower()
+
+    # Isolate context features and register metrics
+    trigrams = extract_term_context_trigrams(tokens, term_lemma)
+    analysis_registry[term][year].extend(trigrams)
+
+
+# BAG-OF-WORDS (BOW) EXTRACTION METRICS
+# Flatten context windows to generate localized frequency mapping arrays per term/year index
+bow_data = defaultdict(dict)
+
+for term, years in analysis_registry.items():
+    for year, trigrams in years.items():
+        flattened_words = [word for trigram in trigrams for word in trigram]
+        bow_data[term][year] = Counter(flattened_words)
+
+
+# FILE FORMATTING & RESTRUCTURING FOR EXPORT
+
+# --- Compile Long-Format Trigrams Frame ---
+trigrams_rows = []
+for term, years in analysis_registry.items():
+    for year, trigrams in years.items():
+        for tg in trigrams:
+            trigrams_rows.append({
+                'Termino': term,
+                'Año': year,
+                'Trigrama': ' '.join(tg)
+            })
+
+df_trigrams = pd.DataFrame(trigrams_rows)
+
+# ---Compile Long-Format Bag-of-Words Frame ---
+bow_rows = []
+for term, years in bow_data.items():
+    for year, counter in years.items():
+        for word, frequency in counter.items():
+            bow_rows.append({
+                'Termino': term,
+                'Año': year,
+                'Palabra': word,
+                'Frecuencia': frequency
+            })
+
+df_bow = pd.DataFrame(bow_rows)
+
+# SAVE
+df_trigrams.to_csv(OUTPUT_TRIGRAMS, index=False, sep=';', encoding='utf-8-sig')
+df_bow.to_csv(OUTPUT_BOW, index=False, sep=';', encoding='utf-8-sig')
+
+print(f"\nTotal extraction density metrics:")
+print(f"  - Unique contextual trigram instances mapped: {len(df_trigrams)}")
+print(f"  - Total Bag-of-Words structural entries:      {len(df_bow)}")
