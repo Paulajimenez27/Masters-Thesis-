@@ -1,0 +1,171 @@
+import re
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+from google.colab import drive
+
+# --- ENVIRONMENT CONFIGURATION ---
+# Mount Google Drive to read filtered predictions and store output results
+drive.mount('/content/drive')
+
+# --- CONFIGURATION & PATHS ---
+# Update your own path
+INPUT_PATH = '...'
+OUTPUT_PATH = '...'
+PRED_COLUMN = "..."  # Name of target column containing the MASK token predictions
+
+# --- CORE FUNCTIONS ---
+
+def top1_prediction(text):
+    """
+    Parses a string of predictions to extract the single word with the highest probability.
+    
+    Expected format: "word1 (0.85), word2 (0.12)..."
+    Returns a tuple (word, probability) or None if no valid pattern is found.
+    """
+    if pd.isna(text):
+        return None
+        
+    # Regular expression to extract words and their respective float probabilities inside parentheses
+    pairs = re.findall(r'([^\(,]+)\s*\(([\d\.]+)\)', str(text))
+    if not pairs:
+        return None
+        
+    # Sort predictions by probability in descending order and extract the top one
+    pairs_sorted = sorted(pairs, key=lambda x: float(x[1]), reverse=True)
+    word, prob = pairs_sorted[0]
+    return (word.strip(), float(prob))
+
+def process_neologism(df_neo):
+    """
+    Processes all occurrences of a specific neologism over time.
+    
+    Applies selection logic:
+      1. Determines how many words to extract per year using a localized Z-Score.
+         Years with frequencies below the average default to 1 extraction.
+      2. Retrieves the Top-1 prediction for every concordance within a specific year.
+      3. Aggregates and ranks words by occurrence frequency. Ties are broken by 
+         the highest mean probability.
+      4. Tracks and attaches the specific Concordance and ID where the extracted 
+         word achieved its individual highest confidence score.
+    """
+    neologism = df_neo["término"].iloc[0]
+
+    # Calculate overall absolute frequency per year for this neologism
+    freq_by_year = df_neo.groupby("fecha").size().reset_index(name="freq")
+
+    # Calculate Z-Score across all active years for this specific term
+    freqs = freq_by_year["freq"].values.astype(float)
+    std = freqs.std(ddof=0)
+
+    if len(freq_by_year) > 1 and std > 0:
+        freq_by_year["zscore"] = (freqs - freqs.mean()) / std
+    else:
+        freq_by_year["zscore"] = 0.0
+
+    # Determine dynamic extraction limits per year:
+    # Z-scores below 0 (below average) default to 0, plus a baseline floor of 1.
+    freq_by_year["n_extract"] = freq_by_year["zscore"].apply(
+        lambda z: max(1, round(max(float(z), 0) + 1)))
+
+    result_rows = []
+
+    # Process year by year
+    for _, row_year in freq_by_year.iterrows():
+        year = row_year["fecha"]
+        n_extract = int(row_year["n_extract"])
+        df_year = df_neo[df_neo["fecha"] == year]
+
+        # Extract top-1 candidate for each concordance in the current year block
+        predictions = []
+        for _, row in df_year.iterrows():
+            pred_res = top1_prediction(row[PRED_COLUMN])
+            if pred_res:
+                predictions.append({
+                    "word": pred_res[0],
+                    "prob": pred_res[1],
+                    "ID_Conc": row["ID_neo"],
+                    "concordancia": row["concordancia"]
+                })
+
+        # Aggregate metrics by predicted word to calculate counts and track the highest scoring context
+        word_counts = defaultdict(lambda: {
+            "count": 0, "prob_sum": 0.0,
+            "best_prob": -1, "ID_Conc": None, "concordancia": None
+        })
+        
+        for p in predictions:
+            w = p["word"]
+            word_counts[w]["count"] += 1
+            word_counts[w]["prob_sum"] += p["prob"]
+            # Track context details for the maximum probability baseline
+            if p["prob"] > word_counts[w]["best_prob"]:
+                word_counts[w]["best_prob"] = p["prob"]
+                word_counts[w]["ID_Conc"] = p["ID_Conc"]
+                word_counts[w]["concordancia"] = p["concordancia"]
+
+        # Rank candidates: 1st by occurrence count (desc), 2nd by average probability (desc)
+        ranking = sorted(
+            word_counts.items(),
+            key=lambda x: (x[1]["count"], x[1]["prob_sum"] / x[1]["count"]),
+            reverse=True
+        )
+
+        selected_candidates = ranking[:n_extract]
+
+        # Handle edge case where no valid predictions were extracted for the block
+        if not selected_candidates:
+            result_rows.append({
+                "ID_Conc": df_year.iloc[0]["ID_neo"],
+                "Neologismo": neologism,
+                "Año": year,
+                "Concordancia": df_year.iloc[0]["concordancia"],
+                "Palabra_Predicha": "[NO_PRED]",
+                "Freq_Año": int(row_year["freq"]),
+                "ZScore_Año": round(float(row_year["zscore"]), 4),
+                "N_Extraer": n_extract,
+                "Repeticiones_Palabra": 0,
+            })
+            continue
+
+        # Append final mapped results for selected words
+        for word, data in selected_candidates:
+            result_rows.append({
+                "ID_Conc": data["ID_Conc"],
+                "Neologismo": neologism,
+                "Año": year,
+                "Concordancia": data["concordancia"],
+                "Palabra_Predicha": word,
+                "Freq_Año": int(row_year["freq"]),
+                "ZScore_Año": round(float(row_year["zscore"]), 4),
+                "N_Extraer": n_extract,
+                "Repeticiones_Palabra": data["count"],
+            })
+
+    return result_rows
+
+
+# --- MAIN EXECUTION ---
+
+df = pd.read_csv(INPUT_PATH)
+
+# Standardize date formatting and drop missing values
+df['fecha'] = pd.to_numeric(df['fecha'], errors='coerce')
+df = df.dropna(subset=['fecha'])
+
+print(f"Dataset Loaded: {len(df)} rows | {df['término'].nunique()} unique neologisms detected.")
+
+all_results = []
+
+# Group by target neologism and run generation pipeline
+for neologism_term, group_df in df.groupby("término"):
+    all_results.extend(process_neologism(group_df))
+
+# Build final output structure
+df_result = pd.DataFrame(all_results)
+
+print(f"\n Extraction completed: {len(df_result)} terms generated in total.")
+
+# --- SAVE TO DRIVE ---
+df_result.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+print(f"\nResults successfully exported to: {OUTPUT_PATH}")
